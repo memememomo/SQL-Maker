@@ -2,9 +2,9 @@ package SQL::Maker;
 use strict;
 use warnings;
 use 5.008001;
-our $VERSION = '0.01';
+our $VERSION = '1.02';
 use Class::Accessor::Lite 0.05 (
-    ro => [qw/quote_char name_sep driver select_class/],
+    ro => [qw/quote_char name_sep new_line driver select_class/],
 );
 
 use Carp ();
@@ -29,44 +29,80 @@ sub new {
     my $class = shift;
     my %args = @_ == 1 ? %{$_[0]} : @_;
     unless ($args{driver}) {
-        Carp::croak("'driver' or 'dbh' is required for creating new instance of $class");
+        Carp::croak("'driver' is required for creating new instance of $class");
     }
     my $driver = $args{driver};
-    $args{quote_char}  ||= do{
-        if ($driver eq  'Oracle' || $driver eq 'Pg') {
-            q{"}
+    unless ( defined $args{quote_char} ) {
+    $args{quote_char} = do{
+        if ($driver eq  'mysql') {
+        q{`}
         } else {
-            q{`}
+        q{"}
         }
     };
-    $args{name_sep}    ||= '.';
+    }
     $args{select_class} = $driver eq 'Oracle' ? 'SQL::Maker::Select::Oracle' : 'SQL::Maker::Select';
-    bless {%args}, $class;
+
+    return bless {
+        name_sep => '.',
+        new_line => "\n",
+        %args
+    }, $class;
 }
 
-# $builder->insert($table, \%values);
+sub new_condition {
+    my $self = shift;
+
+    SQL::Maker::Condition->new(
+        quote_char => $self->{quote_char},
+        name_sep   => $self->{name_sep},
+    );
+}
+
+sub new_select {
+    my $self = shift;
+    my %args = @_==1 ? %{$_[0]} : @_;
+
+    return $self->select_class->new(
+        name_sep   => $self->name_sep,
+        quote_char => $self->quote_char,
+        new_line   => $self->new_line,
+        %args,
+    );
+}
+
+# $builder->insert($table, \%values, \%opt);
+# $builder->insert($table, \@values, \%opt);
 sub insert {
     my ($self, $table, $values, $opt) = @_;
-    my $prefix = $opt->{prefix} || 'INSERT';
+    my $prefix = $opt->{prefix} || 'INSERT INTO';
 
     my $quoted_table = $self->_quote($table);
 
-    my (@columns, @bind_columns, @quoted_columns);
-    while (my ($col, $val) = each %$values) {
+    my (@columns, @bind_columns, @quoted_columns, @values);
+    @values = ref $values eq 'HASH' ? %$values : @$values;
+    while (my ($col, $val) = splice(@values, 0, 2)) {
         push @quoted_columns, $self->_quote($col);
         if (ref($val) eq 'SCALAR') {
             # $builder->insert(foo => { created_on => \"NOW()" });
             push @columns, $$val;
-        } else {
+        }
+        elsif (ref($val) eq 'REF' && ref($$val) eq 'ARRAY') {
+            # $builder->insert( foo => \[ 'UNIX_TIMESTAMP(?)', '2011-04-12 00:34:12' ] );
+            my ( $stmt, @sub_bind ) = @{$$val};
+            push @columns, $stmt;
+            push @bind_columns, @sub_bind;
+        }
+        else {
             # normal values
             push @columns, '?';
             push @bind_columns, $val;
         }
     }
 
-    my $sql  = "$prefix INTO $quoted_table\n";
-       $sql .= '(' . join(', ', @quoted_columns) .')' . "\n" .
-               'VALUES (' . join(', ', @columns) . ')' . "\n";
+    my $sql  = "$prefix $quoted_table" . $self->new_line;
+       $sql .= '(' . join(', ', @quoted_columns) .')' . $self->new_line .
+               'VALUES (' . join(', ', @columns) . ')';
 
     return ($sql, @bind_columns);
 }
@@ -91,15 +127,23 @@ sub update {
 
     my (@columns, @bind_columns);
     # make "SET" clause.
-    while (my ($col, $val) = each %$args) {
+    my @args = ref $args eq 'HASH' ? %$args : @$args;
+    while (my ($col, $val) = splice @args, 0, 2) {
         my $quoted_col = $self->_quote($col);
-        if (ref($val) eq 'SCALAR') {
+        if (ref $val eq 'SCALAR') {
             # $builder->update(foo => { created_on => \"NOW()" });
             push @columns, "$quoted_col = " . $$val;
-        } else {
+        }
+        elsif ( ref $val eq 'REF' && ref $$val eq 'ARRAY' ) {
+            # $builder->update( foo => \[ 'VALUES(foo) + ?', 10 ] );
+            my ( $stmt, @sub_bind ) = @{$$val};
+            push @columns, "$quoted_col = " . $stmt;
+            push @bind_columns, @sub_bind;
+        }
+        else {
             # normal values
             push @columns, "$quoted_col = ?";
-            push @bind_columns, $args->{$col};
+            push @bind_columns, $val;
         }
     }
 
@@ -133,12 +177,25 @@ sub select {
 sub select_query {
     my ($self, $table, $fields, $where, $opt) = @_;
 
-    my $stmt = $self->select_class->new(
-        name_sep   => $self->name_sep,
-        quote_char => $self->quote_char,
+    unless (ref $fields eq 'ARRAY') {
+        Carp::croak("SQL::Maker::select_query: \$fields should be ArrayRef[Str]");
+    }
+
+    my $stmt = $self->new_select(
         select     => $fields,
     );
-    $stmt->add_from($table);
+
+    unless ( ref $table ) {
+        # $table = 'foo'
+        $stmt->add_from( $table );
+    }
+    else {
+        # $table = [ 'foo', [ bar => 'b' ] ]
+        for ( @$table ) {
+            $stmt->add_from( ref $_ eq 'ARRAY' ? @$_ : $_ );
+        }
+    }
+
     $stmt->prefix($opt->{prefix}) if $opt->{prefix};
 
     if ( $where ) {
@@ -149,9 +206,9 @@ sub select_query {
     }
 
     if (my $o = $opt->{order_by}) {
-        if (ref $o) {
+        if (ref $o eq 'ARRAY') {
             for my $order (@$o) {
-                if (ref $order) {
+                if (ref $order eq 'HASH') {
                     # Skinny-ish [{foo => 'DESC'}, {bar => 'ASC'}]
                     $stmt->add_order_by(%$order);
                 } else {
@@ -159,6 +216,9 @@ sub select_query {
                     $stmt->add_order_by(\$order);
                 }
             }
+        } elsif (ref $o eq 'HASH') {
+            # Skinny-ish {foo => 'DESC'}
+            $stmt->add_order_by(%$o);
         } else {
             # just 'foo DESC, bar ASC'
             $stmt->add_order_by(\$o);
@@ -184,8 +244,7 @@ __END__
 =encoding utf8
 
 =for test_synopsis
-
-my ($table, @fields, %where, %opt, %values, %set, $sql, @binds);
+my ($table, @fields, %where, %opt, %values, %set, $sql, @binds, @set);
 
 =head1 NAME
 
@@ -195,7 +254,9 @@ SQL::Maker - Yet another SQL builder
 
     use SQL::Maker;
 
-    my $builder = SQL::Maker->new();
+    my $builder = SQL::Maker->new(
+        driver => 'SQLite', # or your favorite driver
+    );
 
     # SELECT
     ($sql, @binds) = $builder->select($table, \@fields, \%where, \%opt);
@@ -204,10 +265,11 @@ SQL::Maker - Yet another SQL builder
     ($sql, @binds) = $builder->insert($table, \%values);
 
     # DELETE
-    ($sql, @binds) = $builder->delete($table, \%values);
+    ($sql, @binds) = $builder->delete($table, \%where);
 
     # UPDATE
     ($sql, @binds) = $builder->update($table, \%set, \%where);
+    ($sql, @binds) = $builder->update($table, \@set, \%where);
 
 =head1 DESCRIPTION
 
@@ -221,7 +283,7 @@ SQL::Maker is yet another SQL builder class. It is based on L<DBIx::Skinny>'s SQ
 
 Create new instance of SQL::Maker.
 
-Attribuetes are following:
+Attributes are following:
 
 =over 4
 
@@ -231,7 +293,7 @@ Driver name is required. The driver type is needed to create SQL string.
 
 =item quote_char: Str
 
-This is the character that a table or column name will be quoted with. 
+This is the character that a table or column name will be quoted with.
 
 Default: auto detect from $driver.
 
@@ -241,9 +303,26 @@ This is the character that separates a table and column name.
 
 Default: '.'
 
+=item new_line: Str
+
+This is the character that separates a part of statements.
+
+Default: '\n'
+
 =back
 
-=item my ($sql, @binds) = $builder->select($table, \@fields, \%where, \%opt);
+=item my $select = $builder->new_select(%args|\%args);
+
+Create new instance of L<SQL::Maker::Select> from the settings from B<$builder>.
+
+This method returns instance of L<SQL::Maker::Select>.
+
+=item my ($sql, @binds) = $builder->select($table|\@tables, \@fields, \%where, \%opt);
+
+    my ($sql, @binds) = $builder->select('user', ['*'], {name => 'john'}, {order_by => 'user_id DESC'});
+    # =>
+    #   SELECT * FROM `user` WHERE (`name` = ?) ORDER BY user_id DESC
+    #   ['john']
 
 This method returns SQL string and bind variables for SELECT statement.
 
@@ -251,7 +330,9 @@ This method returns SQL string and bind variables for SELECT statement.
 
 =item $table
 
-Table name in scalar.
+=item \@tables
+
+Table name for B<FROM> clause in scalar or arrayref. You can specify the instance of B<SQL::Maker::Select> for sub-query.
 
 =item \@fields
 
@@ -263,7 +344,7 @@ SQL::Maker creates where clause from this hashref via L<SQL::Maker::Condition>.
 
 =item \%opt
 
-This is a options for select statemet
+This is a options for SELECT statement
 
 =over 4
 
@@ -283,6 +364,17 @@ This option makes 'LIMIT $n' clause.
 
 This option makes 'OFFSET $n' clause.
 
+=item $opt->{order_by}
+
+This option makes B<ORDER BY> clause
+
+You can write it as following forms:
+
+    $builder->select(..., order_by => 'foo DESC, bar ASC');
+    $builder->select(..., order_by => ['foo DESC', 'bar ASC']);
+    $builder->select(..., order_by => {foo => 'DESC'});
+    $builder->select(..., order_by => [{foo => 'DESC'}, {bar => 'ASC'}]);
+
 =item $opt->{having}
 
 This option makes HAVING clause
@@ -296,6 +388,11 @@ This option makes 'FOR UPDATE" clause.
 =back
 
 =item my ($sql, @binds) = $builder->insert($table, \%values);
+
+    my ($sql, @binds) = $builder->insert(user => {name => 'john'});
+    # =>
+    #    INSERT INTO `user` (`name`) VALUES (?)
+    #    ['john']
 
 Generate INSERT query.
 
@@ -313,6 +410,11 @@ This is a values for INSERT statement.
 
 =item my ($sql, @binds) = $builder->delete($table, \%where);
 
+    my ($sql, @binds) = $builder->delete($table, \%where);
+    # =>
+    #    DELETE FROM `user` WHERE (`name` = ?)
+    #    ['john']
+
 Generate DELETE query.
 
 =over 4
@@ -329,7 +431,14 @@ SQL::Maker creates where clause from this hashref via L<SQL::Maker::Condition>.
 
 =item my ($sql, @binds) = $builder->update($table, \%set, \%where);
 
+=item my ($sql, @binds) = $builder->update($table, \@set, \%where);
+
 Generate UPDATE query.
+
+    my ($sql, @binds) = $builder->update('user', ['name' => 'john', email => 'john@example.com'], {user_id => 3});
+    # =>
+    #    'UPDATE `user` SET `name` = ?, `email` = ? WHERE (`user_id` = ?)'
+    #    ['john','john@example.com',3]
 
 =over 4
 
@@ -364,6 +473,8 @@ SQL::Maker supports plugin system. Write the code like following.
 =item Why don't you use  SQL::Abstract?
 
 I need more extensible one.
+
+So, this module contains L<SQL::Maker::Select>, the extensible B<SELECT> clause object.
 
 =back
 
